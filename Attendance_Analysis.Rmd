@@ -1,0 +1,239 @@
+---
+title: "Attendace_Analysis"
+output: pdf_document
+date: "2026-11-03"
+---
+
+```{r}
+library(tidyverse)
+library(fixest)
+library(httr)
+library(jsonlite)
+```
+
+```{r}
+df <- read.csv("~/Downloads/mlb_combined_2025.csv")
+```
+
+```{r}
+get_venue_capacity <- function() {
+  # Pull team -> venue -> capacity via the teams endpoint with venue hydration
+  resp <- GET("https://statsapi.mlb.com/api/v1/teams",
+              query = list(sportId = 1, activeStatus = "Y", hydrate = "venue"))
+  teams <- fromJSON(content(resp, "text", encoding = "UTF-8"), flatten = TRUE)$teams
+  
+  tibble(
+    team_abbr = teams$abbreviation,
+    venue_id  = teams$venue.id
+  ) -> team_venue
+  
+  venue_ids <- unique(team_venue$venue_id)
+  cap_list <- map_dfr(venue_ids, function(vid) {
+    v_resp <- GET(paste0("https://statsapi.mlb.com/api/v1/venues/", vid),
+                  query = list(hydrate = "fieldInfo"))
+    v <- fromJSON(content(v_resp, "text", encoding = "UTF-8"), flatten = TRUE)$venues
+    tibble(venue_id = vid, capacity = v$fieldInfo.capacity[1])
+  })
+  
+  team_venue %>% left_join(cap_list, by = "venue_id")
+}
+
+venue_capacity <- get_venue_capacity()
+
+df <- df %>%
+  left_join(venue_capacity %>% select(team_abbr, capacity),
+            by = c("team_abbr" = "team_abbr")) %>%
+  mutate(fill_rate = attendance / capacity)
+
+```
+
+```{r}
+promo_categories <- list(
+  bobblehead   = c("bobblehead"),
+  fireworks    = c("fireworks"),
+  apparel      = c("jersey", "hat", "cap", "shirt", "hoodie"),
+  toy_novelty  = c("toy", "figurine", "bag", "blanket", "backpack"),
+  ticket_offer = c("ticket offer", "discount"),
+  theme_night  = c("night", "day")   # broad catch-all, worth manual review
+)
+
+df <- df %>%
+  mutate(promotion_lower = str_to_lower(replace_na(promotion, "")))
+
+non_promo_descriptors <- c(
+  "doubleheader", "straight doubleheader",
+  "resumption of suspended game", "home opener"
+)
+df <- df %>%
+  mutate(promotion_lower = if_else(
+    promotion_lower %in% non_promo_descriptors, "", promotion_lower
+  ))
+
+promo_categories <- list(
+  bobblehead           = c("bobble"),  # catches "bobblehead" AND standalone "bobble"
+  fireworks            = c("fireworks"),
+  apparel              = c("jersey", "hat", "cap", "shirt", "hoodie", "flannel",
+                           "pullover", "warmup", "jacket", "polo", "vest", "tee",
+                           "tank top", "socks", "sunglasses", "wristband"),
+  toy_novelty          = c("toy", "figurine", "bag", "blanket", "backpack", "plush",
+                           "funko", "bobble"),  # note: overlaps bobblehead deliberately
+  ticket_offer         = c("ticket offer", "discount", "ticket package", "value offer",
+                           "specialty ticket"),
+  pet_night            = c("bark at"),
+  heritage_celebration = c("heritage", "celebration", "aapi", "juneteenth",
+                           "black in baseball", "negro leagues"),
+  concert_entertainment = c("concert", "postgame drone show", "drone show",
+                            "live music", "postgame performance", "pregame performance"),
+  tribute_ceremony     = c("statue", "retirement", "hall of fame", "anniversary",
+                           "induction", "celebration of life"),
+  theme_night          = c("night", "day")   # broad catch-all, worth manual review
+)
+
+for (cat in names(promo_categories)) {
+  pattern <- str_c(promo_categories[[cat]], collapse = "|")
+  df[[str_c("promo_", cat)]] <- str_detect(df$promotion_lower, pattern)
+}
+
+df <- df %>%
+  mutate(
+    has_promotion = promotion_lower != "",
+    promo_uncategorized = has_promotion &
+      !if_any(starts_with("promo_"), ~ .x)  # has a promo but matched no category
+  )
+
+
+df <- df %>%
+  mutate(
+    date = as.Date(date),
+    day_of_week = factor(as.character(wday(date, label = TRUE)),
+                         levels = c("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")),
+    month = droplevels(factor(as.character(month(date, label = TRUE)),
+                              levels = month.abb))
+  )
+
+```
+
+```{r}
+model <- feols(
+  fill_rate ~ promo_bobblehead + promo_fireworks + promo_apparel +
+    promo_toy_novelty + promo_ticket_offer + promo_pet_night +
+    promo_heritage_celebration + promo_concert_entertainment +
+    promo_tribute_ceremony + promo_theme_night +
+    day_of_week + month
+  | team_abbr,   # team fixed effects
+  data = df,
+  cluster = ~team_abbr   # cluster standard errors by team
+)
+
+summary(model)
+
+```
+
+```{r}
+naive_model <- feols(
+  fill_rate ~ promo_bobblehead + promo_fireworks + promo_apparel +
+    promo_toy_novelty + promo_ticket_offer + promo_pet_night +
+    promo_heritage_celebration + promo_concert_entertainment +
+    promo_tribute_ceremony + promo_theme_night,
+  data = df
+)
+
+etable(naive_model, model,
+       headers = c("Naive (no controls)", "Adjusted (FE + day/month controls)"))
+
+```
+
+```{r}
+get_team_divisions <- function() {
+  resp <- GET("https://statsapi.mlb.com/api/v1/teams",
+              query = list(sportId = 1, activeStatus = "Y"))
+  teams <- fromJSON(content(resp, "text", encoding = "UTF-8"), flatten = TRUE)$teams
+  tibble(team_id = teams$id, team_abbr = teams$abbreviation, division_id = teams$division.id)
+}
+
+get_win_pct <- function(season = 2025) {
+  resp <- GET("https://statsapi.mlb.com/api/v1/standings",
+              query = list(leagueId = "103,104", season = season))
+  parsed <- fromJSON(content(resp, "text", encoding = "UTF-8"), flatten = TRUE)
+  # standings' teamRecords has team.id/team.name but NO abbreviation field --
+  # join to `divisions` (from the teams endpoint) via team_id to get team_abbr.
+  team_records <- bind_rows(parsed$records$teamRecords)
+  tibble(
+    team_id = team_records$team.id,
+    win_pct = as.numeric(team_records$winningPercentage)
+  )
+}
+
+divisions <- get_team_divisions()
+win_pcts  <- get_win_pct(season = 2025) %>%
+  left_join(divisions %>% select(team_id, team_abbr), by = "team_id") %>%
+  select(team_abbr, win_pct)
+
+df <- df %>%
+  left_join(divisions, by = "team_abbr") %>%
+  left_join(divisions %>% rename(opponent = team_abbr, opponent_division_id = division_id),
+            by = "opponent") %>%
+  left_join(win_pcts %>% rename(opponent = team_abbr, opponent_win_pct = win_pct),
+            by = "opponent") %>%
+  mutate(rivalry = division_id == opponent_division_id)
+
+model_with_controls <- feols(
+  fill_rate ~ promo_bobblehead + promo_fireworks + promo_apparel +
+    promo_toy_novelty + promo_ticket_offer + promo_pet_night +
+    promo_heritage_celebration + promo_concert_entertainment +
+    promo_tribute_ceremony + promo_theme_night +
+    rivalry + opponent_win_pct +
+    day_of_week + month
+  | team_abbr,
+  data = df,
+  cluster = ~team_abbr
+)
+
+etable(model, model_with_controls,
+       headers = c("Without opponent controls", "With rivalry + opponent win%"))
+
+```
+
+```{r}
+df <- df %>%
+  mutate(is_weekend = day_of_week %in% c("Fri", "Sat", "Sun"))
+
+team_avg_fill <- df %>%
+  group_by(team_abbr) %>%
+  summarize(team_avg_fill_rate = mean(fill_rate, na.rm = TRUE), .groups = "drop")
+
+df <- df %>%
+  left_join(team_avg_fill, by = "team_abbr") %>%
+  mutate(team_avg_fill_rate_centered = team_avg_fill_rate - mean(team_avg_fill_rate, na.rm = TRUE))
+
+interaction_model <- feols(
+  fill_rate ~ has_promotion * is_weekend +
+    has_promotion * team_avg_fill_rate_centered +
+    day_of_week + month
+  | team_abbr,
+  data = df,
+  cluster = ~team_abbr
+)
+
+summary(interaction_model)
+```
+
+```{r}
+avg_capacity <- mean(venue_capacity$capacity, na.rm = TRUE)
+avg_ticket_price <- 35  # PLACEHOLDER -- replace with a real estimate
+
+coefs <- coef(model)
+promo_coef_names <- names(coefs)[str_starts(names(coefs), "promo_")]
+
+effect_summary <- tibble(
+  category = str_remove(str_remove(promo_coef_names, "^promo_"), "TRUE$"),
+  fill_rate_effect = coefs[promo_coef_names]
+) %>%
+  mutate(
+    est_extra_attendees = fill_rate_effect * avg_capacity,
+    est_extra_revenue    = est_extra_attendees * avg_ticket_price
+  ) %>%
+  arrange(desc(fill_rate_effect))
+
+print(effect_summary)
+```
